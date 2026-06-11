@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Challenge 5 — Broken AI Agent Pipeline
+  An agentic workflow: EventBridge → SQS → Lambda (Bedrock) → Step Functions → DynamoDB.
+  Three intentional faults are injected; the AWS DevOps Agent must find them all.
+
+Resources:
+
+  # ── DynamoDB: result store ───────────────────────────────────────────────────
+  ResultTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: challenge5-agent-results
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+
+  # ── SQS: dead-letter queue (created first, no dependencies) ─────────────────
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: challenge5-dlq
+      MessageRetentionPeriod: 3600
+
+  # ── SQS: work queue — FAULT 1: MessageRetentionPeriod absurdly short ─────────
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: DeadLetterQueue
+    Properties:
+      QueueName: challenge5-work-queue
+      VisibilityTimeout: 35
+      MessageRetentionPeriod: 120    # FAULT 1 — messages expire in 60s before Lambda can reliably process them → silent loss / DLQ
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 2
+
+  # ── CloudWatch Alarm: DLQ depth ──────────────────────────────────────────────
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DeadLetterQueue
+    Properties:
+      AlarmName: challenge5-dlq-messages-high
+      AlarmDescription: "Messages landing in DLQ — pipeline is broken"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ── IAM Role: Step Functions — FAULT 3: no DynamoDB write permission ─────────
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: challenge5-sfn-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LogsOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogDelivery
+                  - logs:PutLogEvents
+                Resource: "*"
+      # FAULT 3: dynamodb:PutItem is intentionally absent — every SFN execution fails at StoreResult
+
+  # ── Step Functions: orchestrator ─────────────────────────────────────────────
+  OrchestratorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: StepFunctionsRole
+    Properties:
+      StateMachineName: challenge5-orchestrator
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: "Post-processing pipeline: validate → enrich → store"
+        StartAt: ValidateInput
+        States:
+          ValidateInput:
+            Type: Pass
+            Parameters:
+              run_id.$: "$.run_id"
+              summary.$: "$.summary"
+              validated: true
+            Next: EnrichMetadata
+          EnrichMetadata:
+            Type: Pass
+            Parameters:
+              run_id.$: "$.run_id"
+              summary.$: "$.summary"
+              validated.$: "$.validated"
+              source: "challenge5-pipeline"
+            Next: StoreResult
+          StoreResult:
+            Type: Task
+            Resource: "arn:aws:states:::dynamodb:putItem"
+            Parameters:
+              TableName: challenge5-agent-results
+              Item:
+                run_id:
+                  S.$: "$.run_id"
+                summary:
+                  S.$: "$.summary"
+                source:
+                  S.$: "$.source"
+            End: true
+
+  # ── IAM Role: Lambda — FAULT 2: no bedrock:InvokeModel permission ────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    DependsOn: OrchestratorStateMachine
+    Properties:
+      RoleName: challenge5-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WorkQueue.Arn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt OrchestratorStateMachine.Arn
+      # FAULT 2: bedrock:InvokeModel intentionally absent → AccessDeniedException in Lambda logs
+
+  # ── Lambda: pipeline processor ───────────────────────────────────────────────
+  PipelineProcessor:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaRole
+    Properties:
+      FunctionName: challenge5-pipeline-processor
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !GetAtt OrchestratorStateMachine.Arn
+      Code:
+        ZipFile: |
+          import json, boto3, os, uuid
+
+          bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+          sfn     = boto3.client("stepfunctions")
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  payload = json.loads(record["body"])
+                  run_id  = str(uuid.uuid4())
+
+                  # STEP 1 — call Bedrock (FAULT 2: missing IAM → AccessDeniedException)
+                  try:
+                      resp = bedrock.invoke_model(
+                          modelId="amazon.titan-text-express-v1",
+                          contentType="application/json",
+                          accept="application/json",
+                          body=json.dumps({
+                              "inputText": f"Summarise: {payload.get('message', 'hello')}",
+                              "textGenerationConfig": {"maxTokenCount": 50}
+                          })
+                      )
+                      summary = json.loads(resp["body"].read())["results"][0]["outputText"]
+                  except Exception as e:
+                      print(f"Bedrock error: {e}")
+                      raise  # re-raise → Lambda errors visible in CloudWatch; message hits DLQ via FAULT 1
+
+                  # STEP 2 — hand off to Step Functions
+                  sfn.start_execution(
+                      stateMachineArn=os.environ["STATE_MACHINE_ARN"],
+                      name=run_id,
+                      input=json.dumps({"run_id": run_id, "summary": summary})
+                  )
+
+  # ── SQS → Lambda event source mapping ────────────────────────────────────────
+  SQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn:
+      - PipelineProcessor
+      - LambdaRole
+      - WorkQueue
+    Properties:
+      EventSourceArn: !GetAtt WorkQueue.Arn
+      FunctionName: !GetAtt PipelineProcessor.Arn
+      BatchSize: 1
+      Enabled: true
+
+  # ── EventBridge: scheduled trigger every 2 minutes ───────────────────────────
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    DependsOn: WorkQueue
+    Properties:
+      Name: challenge5-pipeline-trigger
+      Description: "Fires every 2 min — pumps test messages into the broken pipeline"
+      ScheduleExpression: rate(2 minutes)
+      State: ENABLED
+      Targets:
+        - Id: WorkQueueTarget
+          Arn: !GetAtt WorkQueue.Arn
+          Input: '{"message": "Analyse this healthcare report and extract key findings."}'
+
+  # ── SQS queue policy: allow EventBridge to send ───────────────────────────────
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    DependsOn:
+      - WorkQueue
+      - PipelineTriggerRule
+    Properties:
+      Queues:
+        - !Ref WorkQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt WorkQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt PipelineTriggerRule.Arn
+
+Outputs:
+  WorkQueueURL:
+    Value: !Ref WorkQueue
+    Description: SQS Work Queue URL
+  DeadLetterQueueURL:
+    Value: !Ref DeadLetterQueue
+    Description: Dead Letter Queue URL
+  StateMachineArn:
+    Value: !GetAtt OrchestratorStateMachine.Arn
+    Description: Step Functions State Machine ARN
+  LambdaFunction:
+    Value: !Ref PipelineProcessor
+    Description: Pipeline processor Lambda
+  ResultTableName:
+    Value: !Ref ResultTable
+    Description: DynamoDB result table
